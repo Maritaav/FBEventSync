@@ -21,7 +21,10 @@ import android.Manifest;
 import android.accounts.Account;
 import android.accounts.AccountAuthenticatorActivity;
 import android.accounts.AccountManager;
+import android.app.AlertDialog;
 import android.content.ContentResolver;
+import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -31,6 +34,7 @@ import android.provider.CalendarContract;
 import android.support.annotation.NonNull;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
+import android.support.v4.content.FileProvider;
 import android.view.View;
 import android.view.Window;
 import android.webkit.JavascriptInterface;
@@ -46,6 +50,9 @@ import com.loopj.android.http.JsonHttpResponseHandler;
 
 import org.json.JSONObject;
 
+import java.io.File;
+import java.util.Locale;
+
 import cz.msebera.android.httpclient.Header;
 
 public class AuthenticatorActivity extends AccountAuthenticatorActivity {
@@ -60,13 +67,80 @@ public class AuthenticatorActivity extends AccountAuthenticatorActivity {
     private AccountManager mAccountManager = null;
     private String mAuthTokenType = null;
     private String mAccessToken = null;
-    private String mBDayCalendar = null;
+    private String mICalKey = null;
+    private String mICalUid = null;
 
     private WebView mWebView = null;
     private ProgressBar mProgressBar = null;
     private TextView mProgressLabel = null;
 
     private Logger mLogger = null;
+
+    private boolean mEventsPageReached = false;
+
+    private void debugICalUrl() {
+        mProgressBar.setVisibility(View.GONE);
+        mProgressLabel.setVisibility(View.GONE);
+        mWebView.setVisibility(View.VISIBLE);
+        findViewById(R.id.sendWebViewBtn).setVisibility(View.VISIBLE);
+    }
+
+    protected void onProceedDebugICal(View view) {
+
+        final Context context = this;
+
+        new AlertDialog.Builder(this)
+                .setTitle("Proceed?")
+                .setMessage("The HTML source code of the displayed page will be sent to the developer. " +
+                            "The developer promises to not share the email and the data in it with anyone " +
+                            "and that he will delete the email once he has obtain the necessary information.\n\n" +
+                            "Do you still want to proceed?")
+                .setPositiveButton("Yes (will open email client with the page attached)", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        File dir = new File(context.getFilesDir(), "debug");
+                        if (!dir.exists()) {
+                            if (!dir.mkdir()) {
+                                Toast.makeText(context, "Error creating directory", Toast.LENGTH_SHORT).show();
+                                finish();
+                                return;
+                            }
+                        }
+                        mWebView.saveWebArchive(getFilesDir() + "/debug/events.mhtml", false,
+                                new ValueCallback<String>() {
+                                    @Override
+                                    public void onReceiveValue(String value) {
+                                        Intent intent = new Intent(Intent.ACTION_SEND);
+                                        intent.setType("message/rfc822");
+                                        intent.putExtra(Intent.EXTRA_EMAIL, new String[]{ "me@dvratil.cz" });
+                                        intent.putExtra(Intent.EXTRA_SUBJECT, "FBEventSync events page");
+
+                                        intent.putExtra(Intent.EXTRA_TEXT, "The events page source code is in attachment.");
+
+                                        File file = new File(getFilesDir(), "debug/events.mhtml");
+                                        if (!file.exists() || !file.canRead()) {
+                                            Toast.makeText(context, "Couldn't save the events page. Please contact the developer", Toast.LENGTH_SHORT).show();
+                                            finish();
+                                            return;
+                                        }
+
+                                        Uri contentUri = FileProvider.getUriForFile(
+                                                context, getString(R.string.fileprovider_authority), file);
+                                        intent.putExtra(Intent.EXTRA_STREAM, contentUri);
+                                        startActivity(Intent.createChooser(intent, getResources().getString(R.string.log_send_email_action)));
+                                        finish();
+                                    }
+                                });
+                    }
+                })
+                .setNegativeButton("No", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        finish();
+                    }
+                })
+                .show();
+    }
 
     protected void onBirthdayLinkExtracted(String s) {
         mLogger.debug("AUTH","Found bday URL");
@@ -79,7 +153,43 @@ public class AuthenticatorActivity extends AccountAuthenticatorActivity {
         }
 
         // Remove opening and trailing quotes that come from JavaScript
-        mBDayCalendar = s.substring(1, s.length() - 1);
+        final Uri icalUri = Uri.parse(s.substring(1, s.length() - 1));
+        mICalKey = icalUri.getQueryParameter("key");
+        mICalUid = icalUri.getQueryParameter("uid");
+        if (mICalKey == null || mICalKey.isEmpty() || mICalUid == null || mICalUid.isEmpty()) {
+            final Context context = this;
+            new AlertDialog.Builder(this)
+                    .setTitle("Error retrieving iCal URL")
+                    .setMessage("There was an error parsing the Facebook URL. Would you be willing to " +
+                                "share the Facebook webpage with the developer so he can fix the app?\n" +
+                                "WARNING: This will leak some of your private data to the developer " +
+                                "(some of you upcoming events and friends birthday events). You wil see " +
+                                "all of it on the next page and you will still be able to decide not to send " +
+                                "anything.")
+                    .setPositiveButton("Yes", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            mProgressBar.setVisibility(View.GONE);
+                            mProgressLabel.setVisibility(View.GONE);
+                            mWebView.setVisibility(View.VISIBLE);
+                            findViewById(R.id.sendWebViewBtn).setVisibility(View.VISIBLE);
+
+                            mWebView.saveWebArchive(getFilesDir() + "/events.mhtml");
+                        }
+                    })
+                    .setNegativeButton("No", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            mLogger.error("AUTH", "Failed to retrieve iCal URL! The raw URL was " + icalUri.toString());
+                            Toast.makeText(context, getString(R.string.auth_calendar_uri_error_toast), Toast.LENGTH_SHORT)
+                                    .show();
+                            finish();
+                        }
+                    })
+                    .show();
+            return;
+        }
+
         mProgressLabel.setText(getString(R.string.auth_progress_retrieving_userinfo));
         fetchUserInfo(mAccessToken);
     }
@@ -137,6 +247,10 @@ public class AuthenticatorActivity extends AccountAuthenticatorActivity {
                     mWebView.getSettings().setUserAgentString("Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:25.0) Gecko/20100101 Firefox/25.0");
                     mWebView.loadUrl("https://www.facebook.com/events");
                 } else if (uri.getPath().equals("/events/")) {
+                    if (mEventsPageReached) {
+                        return;
+                    }
+                    mEventsPageReached = true;
                     mLogger.debug("AUTH","Reached /events/ page, extracting iCal link");
                     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
                         class JSObject {
@@ -257,29 +371,19 @@ public class AuthenticatorActivity extends AccountAuthenticatorActivity {
             ContentResolver.setSyncAutomatically(account, CalendarContract.AUTHORITY, true);
         }
 
-        Uri icalUri = Uri.parse(mBDayCalendar);
-        String key = icalUri.getQueryParameter("key");
-        String uid = icalUri.getQueryParameter("uid");
-        if (key == null || key.isEmpty() || uid == null || uid.isEmpty()) {
-            mLogger.error("AUTH", "Failed to retrieve iCal URL! The raw URL was " + mBDayCalendar);
-            Toast.makeText(this, getString(R.string.auth_calendar_uri_error_toast), Toast.LENGTH_SHORT)
-                    .show();
-            finish();
-            return;
-        }
         mAccountManager.setUserData(account, Authenticator.DATA_BDAY_URI, null); // clear the legacy storage
         mAccountManager.setAuthToken(account, Authenticator.FB_OAUTH_TOKEN, accessToken);
-        mAccountManager.setAuthToken(account, Authenticator.FB_KEY_TOKEN, key);
-        mAccountManager.setAuthToken(account, Authenticator.FB_UID_TOKEN, uid);
+        mAccountManager.setAuthToken(account, Authenticator.FB_KEY_TOKEN, mICalKey);
+        mAccountManager.setAuthToken(account, Authenticator.FB_UID_TOKEN, mICalUid);
 
         Intent result = new Intent();
         result.putExtra(AccountManager.KEY_ACCOUNT_NAME, accountName);
         result.putExtra(AccountManager.KEY_ACCOUNT_TYPE, intent.getStringExtra(AccountManager.KEY_ACCOUNT_TYPE));
         String authTokenType = intent.getStringExtra(AuthenticatorActivity.ARG_AUTH_TOKEN_TYPE);
         if (authTokenType != null && authTokenType.equals(Authenticator.FB_KEY_TOKEN)) {
-            result.putExtra(AccountManager.KEY_AUTHTOKEN, key);
+            result.putExtra(AccountManager.KEY_AUTHTOKEN, mICalKey);
         } else if (authTokenType != null && authTokenType.equals(Authenticator.FB_UID_TOKEN)) {
-            result.putExtra(AccountManager.KEY_AUTHTOKEN, uid);
+            result.putExtra(AccountManager.KEY_AUTHTOKEN, mICalUid);
         } else {
             result.putExtra(AccountManager.KEY_AUTHTOKEN, accessToken);
         }
